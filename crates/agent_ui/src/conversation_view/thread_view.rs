@@ -12351,7 +12351,35 @@ mod tests {
     use serde_json::json;
     use std::{path::Path, rc::Rc};
     use util::path;
-    use workspace::MultiWorkspace;
+    use workspace::{Item, MultiWorkspace};
+
+    struct TestConversationViewItem(Entity<ConversationView>);
+
+    impl Item for TestConversationViewItem {
+        type Event = ();
+
+        fn include_in_nav_history() -> bool {
+            false
+        }
+
+        fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+            "Test".into()
+        }
+    }
+
+    impl EventEmitter<()> for TestConversationViewItem {}
+
+    impl Focusable for TestConversationViewItem {
+        fn focus_handle(&self, cx: &App) -> FocusHandle {
+            self.0.read(cx).focus_handle(cx)
+        }
+    }
+
+    impl Render for TestConversationViewItem {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.0.clone()
+        }
+    }
 
     async fn setup_thread_view(
         cx: &mut gpui::TestAppContext,
@@ -12390,6 +12418,15 @@ mod tests {
                     cx,
                 )
             })
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(
+                Box::new(cx.new(|_| TestConversationViewItem(conversation_view.clone()))),
+                None,
+                true,
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
 
