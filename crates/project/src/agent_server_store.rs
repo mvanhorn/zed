@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    io::{self, Read as _},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
     time::Duration,
@@ -1410,17 +1411,15 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
             env.extend(extra_env);
             env.extend(settings_env);
 
-            let mut command_args = vec![executable.to_string_lossy().into_owned()];
-            command_args.extend(args);
-            command_args.extend(extra_args);
-
-            let command = AgentServerCommand {
-                path: node_binary,
-                args: command_args,
-                env: Some(env),
-            };
-
-            Ok(command)
+            registry_npx_command_from_fs(
+                fs.as_ref(),
+                executable,
+                node_binary,
+                args,
+                extra_args,
+                env,
+            )
+            .await
         })
     }
 
@@ -1431,6 +1430,83 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+}
+
+const REGISTRY_NPX_EXECUTABLE_HEADER_LIMIT: u64 = 4;
+
+fn is_native_executable_header(header: &[u8]) -> bool {
+    matches!(
+        header,
+        [0x7F, b'E', b'L', b'F', ..]
+            | [0xFE, 0xED, 0xFA, 0xCE, ..]
+            | [0xCE, 0xFA, 0xED, 0xFE, ..]
+            | [0xFE, 0xED, 0xFA, 0xCF, ..]
+            | [0xCF, 0xFA, 0xED, 0xFE, ..]
+            | [0xCA, 0xFE, 0xBA, 0xBE, ..]
+            | [0xBE, 0xBA, 0xFE, 0xCA, ..]
+            | [b'M', b'Z', ..]
+    )
+}
+
+fn read_registry_npx_executable_header(reader: impl io::Read) -> io::Result<Vec<u8>> {
+    let mut header = Vec::new();
+    reader
+        .take(REGISTRY_NPX_EXECUTABLE_HEADER_LIMIT)
+        .read_to_end(&mut header)?;
+    Ok(header)
+}
+
+fn registry_npx_command(
+    executable: PathBuf,
+    node_binary: PathBuf,
+    reader: impl io::Read,
+    registry_args: Vec<String>,
+    extra_args: Vec<String>,
+    env: HashMap<String, String>,
+) -> Result<AgentServerCommand> {
+    let header = read_registry_npx_executable_header(reader)
+        .with_context(|| format!("failed to read agent executable {}", executable.display()))?;
+
+    if is_native_executable_header(&header) {
+        let mut args = registry_args;
+        args.extend(extra_args);
+        Ok(AgentServerCommand {
+            path: executable,
+            args,
+            env: Some(env),
+        })
+    } else {
+        let mut args = vec![executable.to_string_lossy().into_owned()];
+        args.extend(registry_args);
+        args.extend(extra_args);
+        Ok(AgentServerCommand {
+            path: node_binary,
+            args,
+            env: Some(env),
+        })
+    }
+}
+
+async fn registry_npx_command_from_fs(
+    fs: &dyn Fs,
+    executable: PathBuf,
+    node_binary: PathBuf,
+    registry_args: Vec<String>,
+    extra_args: Vec<String>,
+    env: HashMap<String, String>,
+) -> Result<AgentServerCommand> {
+    let reader = fs
+        .open_sync(&executable)
+        .await
+        .with_context(|| format!("failed to open agent executable {}", executable.display()))?;
+    registry_npx_command(
+        executable,
+        node_binary,
+        reader,
+        registry_args,
+        extra_args,
+        env,
+    )
 }
 
 /// People are using min-release-age more frequently. Which means a fresh registry will likely have
@@ -1690,6 +1766,7 @@ mod tests {
     use http_client::{AsyncBody, FakeHttpClient, Response};
     use node_runtime::NodeRuntime;
     use settings::Settings as _;
+    use std::io;
 
     #[cfg(feature = "test-support")]
     const TEST_ARCHIVE_URL: &str = "https://example.test/agent";
@@ -2337,5 +2414,380 @@ mod tests {
                 "agent-b tx should have been transferred"
             );
         });
+    }
+
+    fn preserved_env() -> HashMap<String, String> {
+        let mut env = HashMap::default();
+        env.insert("PATH".into(), "/managed/bin:/usr/bin".into());
+        env.insert("KEEP".into(), "yes".into());
+        env
+    }
+
+    fn command_for_bin_header(
+        executable: &str,
+        header: &[u8],
+        registry_args: &[&str],
+        extra_args: &[&str],
+    ) -> AgentServerCommand {
+        registry_npx_command(
+            PathBuf::from(executable),
+            PathBuf::from("/managed/node"),
+            io::Cursor::new(header),
+            registry_args.iter().map(|arg| (*arg).to_string()).collect(),
+            extra_args.iter().map(|arg| (*arg).to_string()).collect(),
+            preserved_env(),
+        )
+        .unwrap()
+    }
+
+    struct ShortRead<R> {
+        inner: R,
+        max_chunk: usize,
+        bytes_read: usize,
+    }
+
+    impl<R: io::Read> io::Read for ShortRead<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let end = buf.len().min(self.max_chunk);
+            let n = self.inner.read(&mut buf[..end])?;
+            self.bytes_read += n;
+            Ok(n)
+        }
+    }
+
+    struct FailingRead;
+
+    impl io::Read for FailingRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "permission denied",
+            ))
+        }
+    }
+
+    #[test]
+    fn native_headers_launch_package_executable_directly() {
+        let node_binary = PathBuf::from("/managed/node");
+        let registry_args = ["--acp"];
+        let extra_args = ["--extra"];
+        let fixtures: &[(&str, &[u8])] = &[
+            ("elf", b"\x7FELF"),
+            ("macho-32-be", b"\xFE\xED\xFA\xCE"),
+            ("macho-32-le", b"\xCE\xFA\xED\xFE"),
+            ("macho-64-be", b"\xFE\xED\xFA\xCF"),
+            ("macho-64-le", b"\xCF\xFA\xED\xFE"),
+            ("macho-universal", b"\xCA\xFE\xBA\xBE"),
+            ("macho-universal-le", b"\xBE\xBA\xFE\xCA"),
+            ("pe", b"MZ"),
+            ("pe-dos-stub", b"MZ\x90\x00"),
+            ("elf-with-trailing-bytes", b"\x7FELF\x01\x01\x01\x00garbage"),
+        ];
+
+        for (name, header) in fixtures {
+            let executable = format!("/tmp/{name} agent.bin");
+            let command = command_for_bin_header(&executable, header, &registry_args, &extra_args);
+            assert_eq!(command.path, PathBuf::from(&executable), "{name}");
+            assert_ne!(command.path, node_binary, "{name}");
+            assert_eq!(
+                command.args,
+                vec!["--acp".to_string(), "--extra".to_string()],
+                "{name}: registry args must precede extra args, without a Node or duplicated executable argument"
+            );
+            assert_eq!(command.env, Some(preserved_env()), "{name}");
+        }
+    }
+
+    #[test]
+    fn javascript_bins_keep_managed_node_command() {
+        let node_binary = PathBuf::from("/managed/node");
+        let fixtures: &[(&str, &str, &[u8])] = &[
+            (
+                "shebang",
+                "/install/node_modules/pkg/bin/agent.js",
+                b"#!/usr/bin/env node\nconsole.log(1)\n",
+            ),
+            (
+                "no-shebang",
+                "/install/node_modules/pkg/bin/agent.js",
+                b"console.log('hello');\n",
+            ),
+            (
+                "extensionless",
+                "/install/node_modules/pkg/bin/agent",
+                b"exports.run = function () {}\n",
+            ),
+            ("empty", "/install/node_modules/pkg/bin/empty", b""),
+            ("short", "/install/node_modules/pkg/bin/short", b"ab"),
+            (
+                "almost-elf",
+                "/install/node_modules/pkg/bin/almost-elf",
+                b"\x7FEL",
+            ),
+            ("almost-pe", "/install/node_modules/pkg/bin/almost-pe", b"M"),
+            (
+                "spaces-in-path",
+                "/install/my agent/bin",
+                b"#!/usr/bin/env node\n",
+            ),
+        ];
+
+        for (name, executable, header) in fixtures {
+            let command = command_for_bin_header(executable, header, &["--acp"], &["--extra"]);
+            assert_eq!(command.path, node_binary, "{name}");
+            assert_eq!(
+                command.args,
+                vec![
+                    executable.to_string(),
+                    "--acp".to_string(),
+                    "--extra".to_string()
+                ],
+                "{name}"
+            );
+            assert_eq!(command.env, Some(preserved_env()), "{name}");
+        }
+    }
+
+    #[test]
+    fn native_header_read_is_bounded_and_tolerates_short_reads() {
+        let mut native = vec![0x7F, b'E', b'L', b'F'];
+        native.extend(std::iter::repeat_n(0xABu8, 1024 * 1024));
+        let mut reader = ShortRead {
+            inner: io::Cursor::new(native),
+            max_chunk: 1,
+            bytes_read: 0,
+        };
+        let command = registry_npx_command(
+            PathBuf::from("/tmp/native agent"),
+            PathBuf::from("/managed/node"),
+            &mut reader,
+            vec!["--acp".into()],
+            vec!["--extra".into()],
+            preserved_env(),
+        )
+        .unwrap();
+
+        assert!(
+            reader.bytes_read as u64 <= REGISTRY_NPX_EXECUTABLE_HEADER_LIMIT,
+            "read {} bytes from a 1MiB native bin",
+            reader.bytes_read
+        );
+        assert_eq!(command.path, PathBuf::from("/tmp/native agent"));
+        assert_eq!(
+            command.args,
+            vec!["--acp".to_string(), "--extra".to_string()]
+        );
+    }
+
+    #[test]
+    fn unreadable_bin_returns_executable_path_context() {
+        let executable = PathBuf::from("/tmp/unreadable agent");
+        let error = registry_npx_command(
+            executable.clone(),
+            PathBuf::from("/managed/node"),
+            FailingRead,
+            Vec::new(),
+            Vec::new(),
+            HashMap::default(),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("failed to read agent executable"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains(&executable.display().to_string()),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("permission denied"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[gpui::test]
+    async fn inspects_native_bins_through_symlinks_and_hardlinks(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let fs: Arc<dyn Fs> = fs::RealFs::new(None, cx.executor());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let target = temp_dir.path().join("agent bin");
+        std::fs::write(&target, b"\x7FELF\x01\x01\x01\x00").unwrap();
+
+        let mut linked_paths = vec![target.clone()];
+
+        let hardlink = temp_dir.path().join("agent-hard");
+        match std::fs::hard_link(&target, &hardlink) {
+            Ok(()) => linked_paths.push(hardlink),
+            Err(error) => {
+                eprintln!("skipping hardlink inspection; not supported: {error}");
+            }
+        }
+
+        let symlink = temp_dir.path().join("agent-symlink");
+        let symlink_result = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&target, &symlink)
+            }
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_file(&target, &symlink)
+            }
+        };
+        match symlink_result {
+            Ok(()) => linked_paths.push(symlink),
+            Err(error) => {
+                eprintln!("skipping symlink inspection; not supported: {error}");
+            }
+        }
+
+        for path in linked_paths {
+            let command = registry_npx_command_from_fs(
+                fs.as_ref(),
+                path.clone(),
+                PathBuf::from("/managed/node"),
+                vec!["--acp".into()],
+                vec!["--extra".into()],
+                preserved_env(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(command.path, path);
+            assert_eq!(
+                command.args,
+                vec!["--acp".to_string(), "--extra".to_string()]
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn missing_and_dangling_bins_return_open_path_context(cx: &mut TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.create_dir(Path::new("/pkg")).await.unwrap();
+        fs.insert_symlink(Path::new("/pkg/dangling"), PathBuf::from("/pkg/gone"))
+            .await;
+
+        for path in [
+            PathBuf::from("/missing/agent"),
+            PathBuf::from("/pkg/dangling"),
+        ] {
+            let error = registry_npx_command_from_fs(
+                fs.as_ref(),
+                path.clone(),
+                PathBuf::from("/managed/node"),
+                Vec::new(),
+                Vec::new(),
+                HashMap::default(),
+            )
+            .await
+            .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("failed to open agent executable"),
+                "unexpected error: {message}"
+            );
+            assert!(
+                message.contains(&path.display().to_string()),
+                "unexpected error: {message}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn fake_fs_native_and_javascript_bins_select_expected_commands(cx: &mut TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.create_dir(Path::new("/pkg")).await.unwrap();
+        fs.insert_file(
+            Path::new("/pkg/native"),
+            b"\xCA\xFE\xBA\xBE\x00\x00".to_vec(),
+        )
+        .await;
+        fs.insert_file(
+            Path::new("/pkg/script"),
+            b"#!/usr/bin/env node\nconsole.log(1)\n".to_vec(),
+        )
+        .await;
+        fs.insert_symlink(Path::new("/pkg/native-link"), PathBuf::from("/pkg/native"))
+            .await;
+
+        let native_command = registry_npx_command_from_fs(
+            fs.as_ref(),
+            PathBuf::from("/pkg/native-link"),
+            PathBuf::from("/managed/node"),
+            vec!["--acp".into()],
+            vec!["--extra".into()],
+            preserved_env(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(native_command.path, PathBuf::from("/pkg/native-link"));
+        assert_eq!(
+            native_command.args,
+            vec!["--acp".to_string(), "--extra".to_string()]
+        );
+
+        let script_command = registry_npx_command_from_fs(
+            fs.as_ref(),
+            PathBuf::from("/pkg/script"),
+            PathBuf::from("/managed/node"),
+            vec!["--acp".into()],
+            vec!["--extra".into()],
+            preserved_env(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(script_command.path, PathBuf::from("/managed/node"));
+        assert_eq!(
+            script_command.args,
+            vec![
+                "/pkg/script".to_string(),
+                "--acp".to_string(),
+                "--extra".to_string()
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn unreadable_real_bin_returns_open_path_context(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+
+        cx.executor().allow_parking();
+        let fs: Arc<dyn Fs> = fs::RealFs::new(None, cx.executor());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("secret agent");
+        std::fs::write(&path, b"#!/usr/bin/env node\n").unwrap();
+        let original = std::fs::metadata(&path).unwrap().permissions();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = registry_npx_command_from_fs(
+            fs.as_ref(),
+            path.clone(),
+            PathBuf::from("/managed/node"),
+            Vec::new(),
+            Vec::new(),
+            HashMap::default(),
+        )
+        .await;
+        std::fs::set_permissions(&path, original).unwrap();
+
+        let error = match result {
+            Ok(_) => {
+                eprintln!(
+                    "skipping permission-denied inspection; this account can still read mode 000 files"
+                );
+                return;
+            }
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("failed to open agent executable"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains(&path.display().to_string()),
+            "unexpected error: {message}"
+        );
     }
 }
