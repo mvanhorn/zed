@@ -1063,7 +1063,7 @@ struct ModelLimits {
 
 #[derive(Deserialize)]
 struct ModelTransport {
-    npm: String,
+    npm: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1117,7 +1117,7 @@ fn parse_discovered_models(
             let transport = metadata
                 .provider
                 .as_ref()
-                .map(|provider| provider.npm.as_str())
+                .and_then(|provider| provider.npm.as_deref())
                 .or(provider.npm.as_deref());
             let protocol = transport.and_then(protocol_for_transport)?;
             let reasoning_effort_levels = metadata
@@ -1848,7 +1848,8 @@ mod tests {
                             "tool_call": true,
                             "interleaved": true,
                             "modalities": {"input":["text","image"],"output":["text"]},
-                            "limit": {"context": 12345,"output": 678}
+                            "limit": {"context": 12345,"output": 678},
+                            "provider": {"api": "https://opencode.ai/zen/go/v1"}
                         }
                     }
                 }
